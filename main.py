@@ -54,13 +54,22 @@ def _db_init():
             FOREIGN KEY(user_id) REFERENCES users(user_id)
         );
     """)
+    # старая схема channels могла быть без owner_id. создадим если нет
     DB.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             chat_id     INTEGER PRIMARY KEY,
             title       TEXT,
-            added_at    INTEGER NOT NULL
+            added_at    INTEGER NOT NULL,
+            owner_id    INTEGER,           -- добавлено
+            username    TEXT               -- добавлено
         );
     """)
+    # миграции столбцов, если вдруг отсутствуют
+    cols = {r[1] for r in DB.execute("PRAGMA table_info(channels)")}
+    if "owner_id" not in cols:
+        DB.execute("ALTER TABLE channels ADD COLUMN owner_id INTEGER;")
+    if "username" not in cols:
+        DB.execute("ALTER TABLE channels ADD COLUMN username TEXT;")
     DB.commit()
 
 _db_init()
@@ -73,7 +82,7 @@ def ensure_user(user_id: int, username: str | None):
         "INSERT OR IGNORE INTO users(user_id, username, is_admin, created_at) VALUES(?,?,?,?)",
         (user_id, (username or ""), 1 if user_id == getattr(config, "ADMIN_ID", 0) else 0, now_ts())
     )
-    if username:
+    if username is not None:
         DB.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
     DB.commit()
 
@@ -108,16 +117,31 @@ def grant_subscription(user_id: int, plan: str, gifted_by: int | None = None):
     )
     DB.commit()
 
-# --- channels helpers ---
-def channels_all() -> list[tuple[int, str]]:
-    cur = DB.execute("SELECT chat_id, COALESCE(title,'') FROM channels ORDER BY added_at DESC")
-    return [(int(r[0]), r[1]) for r in cur.fetchall()]
+# --- channels helpers (НОВОЕ) ---
+def channels_all_admin():
+    cur = DB.execute("""
+        SELECT c.chat_id, c.title, c.username, c.owner_id,
+               COALESCE(u.username,'') AS owner_username
+        FROM channels c
+        LEFT JOIN users u ON u.user_id = c.owner_id
+        ORDER BY c.added_at DESC
+    """)
+    return cur.fetchall()
 
-def channel_add(chat_id: int, title: str | None):
-    DB.execute(
-        "INSERT OR REPLACE INTO channels(chat_id, title, added_at) VALUES(?,?,?)",
-        (chat_id, title or "", now_ts())
-    )
+def channels_by_owner(owner_id: int):
+    cur = DB.execute("""
+        SELECT chat_id, COALESCE(title,''), COALESCE(username,'')
+        FROM channels
+        WHERE owner_id=?
+        ORDER BY added_at DESC
+    """, (owner_id,))
+    return cur.fetchall()
+
+def channel_add_owned(owner_id: int, chat_id: int, title: str | None, username: str | None):
+    DB.execute("""
+        INSERT OR REPLACE INTO channels(chat_id, title, added_at, owner_id, username)
+        VALUES(?,?,?,?,?)
+    """, (chat_id, title or "", now_ts(), owner_id, (username or "")))
     DB.commit()
 
 def channel_remove(chat_id: int):
@@ -136,10 +160,9 @@ def is_admin(user_id: int, username: str | None) -> bool:
     return False
 
 def is_channel_allowed(chat_id: int) -> bool:
-    rows = channels_all()
-    if not rows:  # если список пуст — разрешаем любые (поведение по умолчанию)
-        return True
-    return any(cid == chat_id for cid, _ in rows)
+    # теперь работаем ТОЛЬКО в привязанных каналах
+    cur = DB.execute("SELECT 1 FROM channels WHERE chat_id=? LIMIT 1", (chat_id,))
+    return cur.fetchone() is not None
 
 # ======================== ТЕКСТЫ/КНОПКИ ЛИЧКИ =========================
 
@@ -159,15 +182,17 @@ def kb_private(user_id: int | None = None, username: str | None = None) -> Reply
     # «Создать кнопку» — только подписчики или админ
     if user_id and (has_active_subscription(user_id) or is_admin(user_id, username)):
         rows.insert(1, [KeyboardButton(text="Создать кнопку")])
+        rows.append([KeyboardButton(text="Привязать канал")])
+        rows.append([KeyboardButton(text="Мои каналы")])
     if user_id and is_admin(user_id, username):
         rows.append([KeyboardButton(text="Админ панель")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def kb_admin() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Привязать канал", callback_data="admin:bind")],
-        [InlineKeyboardButton(text="🗑 Отвязать канал", callback_data="admin:unbind")],
-        [InlineKeyboardButton(text="📋 Список каналов", callback_data="admin:list")],
+        [InlineKeyboardButton(text="🔗 Привязать канал (инструкция ниже)", callback_data="admin:bindinfo")],
+        [InlineKeyboardButton(text="📋 Каналы (все)", callback_data="admin:listch")],
+        [InlineKeyboardButton(text="🗑 Отвязать канал (по ID)", callback_data="admin:unbindask")],
         [InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="admin:grant")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="🧮 Статистика", callback_data="admin:stats")],
@@ -195,7 +220,7 @@ class CreateBtn(StatesGroup):
     url = State()
 
 class AdminBind(StatesGroup):
-    wait = State()
+    wait = State()      # больше не используется для форварда, но оставим, если надо
 
 class AdminUnbind(StatesGroup):
     wait = State()
@@ -210,6 +235,9 @@ class AdminGrant(StatesGroup):
 class GiftBuy(StatesGroup):
     plan = State()
     target = State()
+
+class ChannelLink(StatesGroup):
+    wait_forward = State()
 
 # ======================== УТИЛИТЫ КНОПОК/ПАРСИНГ =========================
 
@@ -370,7 +398,7 @@ async def send_subscription_invoice(m: Message, plan: str, *, gift_to_user_id: i
         "gift_to_username": gift_to_username,
     })
 
-    prices = [LabeledPrice(label=f"{plan_human(plan)}", amount=price)]  # XTR: amount = Stars (целое число)
+    prices = [LabeledPrice(label=f"{plan_human(plan)}", amount=price)]  # XTR
 
     await m.bot.send_invoice(
         chat_id=m.chat.id,
@@ -759,6 +787,92 @@ async def activate_gift(m: Message):
     except Exception:
         pass
 
+# ======================== УПРАВЛЕНИЕ КАНАЛАМИ (ПОЛЬЗОВАТЕЛЬ) =========================
+
+@router.message((F.chat.type == ChatType.PRIVATE) & (F.text == "Привязать канал"))
+async def user_link_channel(m: Message, state: FSMContext):
+    if not (has_active_subscription(m.from_user.id) or is_admin(m.from_user.id, m.from_user.username)):
+        await m.answer("Привязка канала доступна только по подписке.",
+                       reply_markup=kb_private(m.from_user.id, m.from_user.username))
+        return
+    await m.answer("Перешли сюда любое сообщение из канала, который хочешь привязать.\n"
+                   "Ты должен быть владельцем (creator) канала, а бот — админом канала.")
+    await state.set_state(ChannelLink.wait_forward)
+
+@router.message(ChannelLink.wait_forward, (F.chat.type == ChatType.PRIVATE))
+async def user_link_channel_step(m: Message, state: FSMContext):
+    ch = getattr(m, "forward_from_chat", None)
+    if not ch or ch.type != ChatType.CHANNEL:
+        await m.answer("Это не пересланное сообщение из канала. Попробуй снова.\n"
+                       "Перешли ЛЮБОЕ сообщение из нужного канала.")
+        return
+
+    chat_id = ch.id
+    # проверка прав бота в канале
+    try:
+        me_member = await m.bot.get_chat_member(chat_id, (await m.bot.get_me()).id)
+        if me_member.status not in ("administrator", "creator"):
+            await m.answer("Бот должен быть администратором канала. Добавь его админом и повтори.")
+            return
+    except Exception:
+        await m.answer("Не удалось проверить права бота. Убедись, что бот добавлен в канал как админ.")
+        return
+
+    # проверка, что пользователь — владелец (creator)
+    try:
+        admins = await m.bot.get_chat_administrators(chat_id)
+        creator = next((a for a in admins if a.status == "creator"), None)
+        if not creator or creator.user.id != m.from_user.id:
+            await m.answer("Ты не являешься владельцем (creator) этого канала.")
+            return
+    except Exception:
+        await m.answer("Не удалось получить администраторов канала.")
+        return
+
+    channel_add_owned(m.from_user.id, chat_id, ch.title, ch.username)
+    await state.clear()
+    await m.answer(f"Канал <b>{ch.title}</b> привязан ✅",
+                   reply_markup=kb_private(m.from_user.id, m.from_user.username))
+
+@router.message((F.chat.type == ChatType.PRIVATE) & (F.text == "Мои каналы"))
+async def my_channels_list(m: Message):
+    rows = channels_by_owner(m.from_user.id)
+    if not rows:
+        await m.answer("У тебя нет привязанных каналов.")
+        return
+
+    kb = []
+    text_lines = ["<b>Твои каналы:</b>"]
+    for chat_id, title, uname in rows:
+        uname_t = f"@{uname}" if uname else "—"
+        text_lines.append(f"• {title} ({uname_t}) — <code>{chat_id}</code>")
+        kb.append([InlineKeyboardButton(text=f"Отвязать «{title}»", callback_data=f"unlink:{chat_id}")])
+    await m.answer("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data.startswith("unlink:"))
+async def unlink_channel_cb(cq: CallbackQuery):
+    chat_id = int(cq.data.split(":", 1)[1])
+
+    # если не админ — можно отвязать только свой канал
+    if not is_admin(cq.from_user.id, cq.from_user.username):
+        cur = DB.execute("SELECT owner_id FROM channels WHERE chat_id=?", (chat_id,))
+        row = cur.fetchone()
+        if not row or int(row[0]) != cq.from_user.id:
+            await cq.answer("Ты не можешь отвязать этот канал.", show_alert=True)
+            return
+
+    # выйти из канала и удалить запись
+    try:
+        await cq.bot.leave_chat(chat_id)
+    except Exception:
+        pass
+    channel_remove(chat_id)
+    await cq.answer("Канал отвязан.", show_alert=True)
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+
 # ======================== АДМИН-ПАНЕЛЬ =========================
 
 @router.message((F.chat.type == ChatType.PRIVATE) & (F.text.lower() == "админ панель"))
@@ -790,31 +904,32 @@ async def admin_callbacks(cq: CallbackQuery, state: FSMContext):
 
     action = cq.data.split(":", 1)[1]
 
-    if action == "bind":
-        await state.set_state(AdminBind.wait)
+    if action == "bindinfo":
         await cq.message.answer(
-            "Привязка канала:\n"
-            "1) Добавь бота админом в канале (право публиковать/удалять).\n"
-            "2) Перешли сюда любой пост с канала ИЛИ пришли @username канала, ИЛИ -100<id>.",
+            "🔗 <b>Как привязать канал (для пользователя):</b>\n"
+            "1) Добавь бота админом в своём канале.\n"
+            "2) В личке нажми «Привязать канал» и перешли сюда любое сообщение из канала.\n"
+            "3) Канал появится в «Мои каналы».",
         )
         await cq.answer()
-    elif action == "unbind":
-        chans = channels_all()
-        if not chans:
-            await cq.message.answer("Список каналов пуст.")
+    elif action == "listch":
+        rows = channels_all_admin()
+        if not rows:
+            await cq.message.answer("Нет привязанных каналов.")
             await cq.answer()
             return
-        await state.set_state(AdminUnbind.wait)
-        listing = "\n".join([f"• {t or 'Без названия'} — <code>{cid}</code>" for cid, t in chans])
-        await cq.message.answer("Кого отвязать? Пришли -100id или @username.\n\nТекущие:\n" + listing)
+        out = ["<b>Все каналы:</b>"]
+        kb = []
+        for chat_id, title, uname, owner_id, owner_username in rows:
+            owner_tag = f"@{owner_username}" if owner_username else owner_id
+            uname_t = f"@{uname}" if uname else "—"
+            out.append(f"• {title} ({uname_t}) — владелец {owner_tag} — <code>{chat_id}</code>")
+            kb.append([InlineKeyboardButton(text=f"Отвязать «{title}»", callback_data=f"unlink:{chat_id}")])
+        await cq.message.answer("\n".join(out), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
         await cq.answer()
-    elif action == "list":
-        chans = channels_all()
-        if not chans:
-            await cq.message.answer("Каналы не привязаны.")
-        else:
-            listing = "\n".join([f"• {t or 'Без названия'} — <code>{cid}</code>" for cid, t in chans])
-            await cq.message.answer("<b>Привязанные каналы:</b>\n" + listing)
+    elif action == "unbindask":
+        await cq.message.answer("Пришли -100id канала или @username для отвязки.")
+        await state.set_state(AdminUnbind.wait)
         await cq.answer()
     elif action == "grant":
         await state.set_state(AdminGrant.user)
@@ -836,9 +951,6 @@ async def admin_callbacks(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer(f"Пользователей: {users}\nАктивных подписок: {active}")
         await cq.answer()
     elif action == "makebtn":
-        if not is_admin(cq.from_user.id, cq.from_user.username) and not has_active_subscription(cq.from_user.id):
-            await cq.answer("Эта функция по подписке. Оформи /plans.", show_alert=True)
-            return
         await state.set_state(CreateBtn.text)
         await cq.message.answer(
             "Ок! Отправь текст сообщения, который я опубликую с кнопкой.\n"
@@ -846,66 +958,32 @@ async def admin_callbacks(cq: CallbackQuery, state: FSMContext):
         )
         await cq.answer()
 
-@router.message(AdminBind.wait, (F.chat.type == ChatType.PRIVATE))
-async def admin_bind_receive(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id, m.from_user.username):
-        return
-
-    if m.forward_from_chat and m.forward_from_chat.type == ChatType.CHANNEL:
-        chat = m.forward_from_chat
-        channel_add(chat.id, chat.title)
-        await state.clear()
-        await m.answer(f"Готово! Канал привязан: {chat.title or chat.id} (<code>{chat.id}</code>).")
-        return
-
-    cid, uname = _parse_chat_ref(m.text or "")
-    if uname:
-        try:
-            chat = await m.bot.get_chat("@"+uname)
-            if chat.type != ChatType.CHANNEL:
-                await m.answer("Это не канал.")
-                return
-            channel_add(chat.id, chat.title)
-            await state.clear()
-            await m.answer(f"Готово! Канал @{uname} привязан (<code>{chat.id}</code>).")
-        except Exception:
-            await m.answer("Не удалось получить канал по @username. Убедись, что бот — админ канала.")
-        return
-    if cid:
-        try:
-            chat = await m.bot.get_chat(cid)
-            if chat.type != ChatType.CHANNEL:
-                await m.answer("Это не канал.")
-                return
-            channel_add(chat.id, chat.title)
-            await state.clear()
-            await m.answer(f"Готово! Канал привязан: {chat.title or cid} (<code>{cid}</code>).")
-        except Exception:
-            await m.answer("Не удалось получить канал по ID. Убедись, что бот — админ канала.")
-        return
-
-    await m.answer("Пришли форвард из канала, @username или -100id.")
-
 @router.message(AdminUnbind.wait, (F.chat.type == ChatType.PRIVATE))
 async def admin_unbind_receive(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id, m.from_user.username):
         return
     cid, uname = _parse_chat_ref(m.text or "")
+    target_chat_id = None
     if uname:
         try:
             chat = await m.bot.get_chat("@"+uname)
-            channel_remove(chat.id)
-            await state.clear()
-            await m.answer(f"Канал @{uname} отвязан.")
+            target_chat_id = chat.id
         except Exception:
             await m.answer("Не нашёл канал по @username.")
+            return
+    elif cid:
+        target_chat_id = cid
+    else:
+        await m.answer("Пришли @username или -100id.")
         return
-    if cid:
-        channel_remove(cid)
-        await state.clear()
-        await m.answer(f"Канал <code>{cid}</code> отвязан.")
-        return
-    await m.answer("Пришли @username или -100id.")
+
+    try:
+        await m.bot.leave_chat(target_chat_id)
+    except Exception:
+        pass
+    channel_remove(target_chat_id)
+    await state.clear()
+    await m.answer(f"Канал <code>{target_chat_id}</code> отвязан.")
 
 @router.message(AdminBroadcast.text, (F.chat.type == ChatType.PRIVATE))
 async def admin_broadcast_send(m: Message, state: FSMContext):
@@ -1060,7 +1138,7 @@ async def main():
         BotCommand(command="admin", description="Админ панель"),
     ])
 
-    # запускаем фоновый автоапдейтер
+    # авто-обновление из git
     asyncio.create_task(git_autoupdate_loop())
 
     await bot.delete_webhook(drop_pending_updates=True)
