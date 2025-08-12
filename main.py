@@ -171,6 +171,20 @@ def kb_admin() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🧩 Сделать кнопку (мастер)", callback_data="admin:makebtn")],
     ])
 
+# ====== НОВОЕ: инлайн-клавиатура планов (Купить/Подарить) ======
+def kb_plans_inline() -> InlineKeyboardMarkup:
+    p = config.PRICES_STARS
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Неделя — {p['week']}⭐", callback_data="buy:week"),
+         InlineKeyboardButton(text="🎁 Подарить", callback_data="gift:week")],
+        [InlineKeyboardButton(text=f"💳 Месяц — {p['month']}⭐", callback_data="buy:month"),
+         InlineKeyboardButton(text="🎁 Подарить", callback_data="gift:month")],
+        [InlineKeyboardButton(text=f"💳 Год — {p['year']}⭐", callback_data="buy:year"),
+         InlineKeyboardButton(text="🎁 Подарить", callback_data="gift:year")],
+        [InlineKeyboardButton(text=f"💳 Навсегда — {p['forever']}⭐", callback_data="buy:forever"),
+         InlineKeyboardButton(text="🎁 Подарить", callback_data="gift:forever")],
+    ])
+
 # ======================== СОСТОЯНИЯ =========================
 
 class CreateBtn(StatesGroup):
@@ -190,6 +204,11 @@ class AdminBroadcast(StatesGroup):
 class AdminGrant(StatesGroup):
     user = State()
     plan = State()
+
+# ====== НОВОЕ: состояние для подарка из инлайна ======
+class GiftBuy(StatesGroup):
+    plan = State()
+    target = State()
 
 # ======================== УТИЛИТЫ КНОПОК/ПАРСИНГ =========================
 
@@ -219,10 +238,6 @@ def _find_next(text_lower: str, start: int, triggers_lower: list[str]):
     return nxt, tlen
 
 def parse_buttons_and_clean(text: str, triggers: list[str]):
-    """
-    Ищет ВСЕ <trigger> Название "url" (trigger = '/button' или '@username_bot'),
-    возвращает (очищенный_текст, [(label, url), ...]).
-    """
     text_lower = text.lower()
     triggers_lower = [t.lower() for t in triggers]
 
@@ -238,7 +253,6 @@ def parse_buttons_and_clean(text: str, triggers: list[str]):
         while j < len(text) and text[j].isspace():
             j += 1
 
-        # ищем первую «кавычку URL» и берём label до неё
         quote_pos, quote_char = None, None
         k = j
         while k < len(text):
@@ -278,7 +292,6 @@ def parse_buttons_and_clean(text: str, triggers: list[str]):
     if not buttons:
         return text, []
 
-    # вырезаем триггеры и нормализуем пробелы
     out, last = [], 0
     for s, e in sorted(spans):
         out.append(text[last:s])
@@ -453,12 +466,10 @@ async def plans_cmd(m: Message):
         f"• Год — {prices['year']}⭐",
         f"• Навсегда — {prices['forever']}⭐",
         "",
-        "Купить себе: /buy <week|month|year|forever>",
-        "Подарить: ответь на сообщение получателя командой /gift <plan>\nили /gift <plan> @username",
-        "",
-        "Даритель со своей активной подпиской получает скидку -25% на подарок.",
+        "Нажми кнопку ниже, чтобы купить или подарить.",
+        "Скидка на подарок −25% работает только если у дарителя уже есть активная подписка.",
     ]
-    await m.answer("\n".join(lines), reply_markup=kb_private(m.from_user.id, m.from_user.username))
+    await m.answer("\n".join(lines), reply_markup=kb_plans_inline())
 
 @router.message(Command("status"), (F.chat.type == ChatType.PRIVATE))
 async def status_cmd(m: Message):
@@ -515,13 +526,10 @@ async def buy_cmd(m: Message):
 @router.message(Command("gift"), (F.chat.type == ChatType.PRIVATE))
 async def gift_cmd(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
-
-    # Жёсткое требование: у дарителя должна быть активная своя подписка
     if not has_active_subscription(m.from_user.id):
         await m.answer("Дарить можно только если у тебя уже есть активная подписка. Сначала оформи /buy.",
                        reply_markup=kb_private(m.from_user.id, m.from_user.username))
         return
-
     parts = (m.text or "").split()
     if len(parts) < 2:
         await m.answer("Формат: в ответ на сообщение получателя — /gift <plan>\nили /gift <plan> @username",
@@ -548,6 +556,66 @@ async def gift_cmd(m: Message):
             return
 
     await send_subscription_invoice(m, plan, gift_to_user_id=gift_to_user_id, gift_to_username=gift_to_username)
+
+# ====== НОВОЕ: кнопки Купить/Подарить (инлайн) ======
+
+@router.callback_query(F.data.startswith("buy:"))
+async def cb_buy(cq: CallbackQuery):
+    if cq.message.chat.type != ChatType.PRIVATE:
+        await cq.answer("Открой меня в личке, там оформим покупку.", show_alert=True)
+        return
+    plan = normalize_plan(cq.data.split(":", 1)[1])
+    if not plan:
+        await cq.answer("Неизвестный тариф", show_alert=True)
+        return
+    await send_subscription_invoice(cq.message, plan)
+    await cq.answer()
+
+@router.callback_query(F.data.startswith("gift:"))
+async def cb_gift(cq: CallbackQuery, state: FSMContext):
+    if cq.message.chat.type != ChatType.PRIVATE:
+        await cq.answer("Открой меня в личке, там оформим подарок.", show_alert=True)
+        return
+    if not has_active_subscription(cq.from_user.id):
+        await cq.answer("Сначала оформи свою подписку — тогда будет скидка −25% на подарок.", show_alert=True)
+        return
+    plan = normalize_plan(cq.data.split(":", 1)[1])
+    if not plan:
+        await cq.answer("Неизвестный тариф", show_alert=True)
+        return
+    await state.set_state(GiftBuy.target)
+    await state.update_data(plan=plan)
+    await cq.message.answer(
+        "Кому подарить? Ответь на сообщение получателя ИЛИ пришли @username.\n"
+        "После этого выставлю счёт со скидкой −25%."
+    )
+    await cq.answer()
+
+@router.message(GiftBuy.target, (F.chat.type == ChatType.PRIVATE))
+async def gift_target_step(m: Message, state: FSMContext):
+    data = await state.get_data()
+    plan = data.get("plan")
+
+    gift_to_user_id = None
+    gift_to_username = None
+
+    if m.reply_to_message and m.reply_to_message.from_user:
+        gift_to_user_id = m.reply_to_message.from_user.id
+        ensure_user(gift_to_user_id, m.reply_to_message.from_user.username)
+    else:
+        t = (m.text or "").strip()
+        if t.startswith("@"):
+            gift_to_username = t[1:]
+        else:
+            await m.answer("Укажи получателя: ответь на его сообщение или пришли @username.")
+            return
+
+    await send_subscription_invoice(
+        m, plan,
+        gift_to_user_id=gift_to_user_id,
+        gift_to_username=gift_to_username
+    )
+    await state.clear()
 
 # ======================== МАСТЕР "СОЗДАТЬ КНОПКУ" (личка) =========================
 
@@ -636,7 +704,6 @@ async def on_success_payment(m: Message):
             except Exception:
                 pass
         else:
-            # Если указали @username и получатель ещё не писал боту — сообщаем, что нужна команда активации
             grant_subscription(buyer_id, plan, gifted_by=buyer_id)  # временно у дарителя
             await m.answer(
                 "Оплата прошла. Я временно привязал подписку к тебе. "
@@ -655,7 +722,6 @@ async def activate_gift(m: Message):
         return
     username = parts[1][1:]
 
-    # Найти юзера по username (если уже писал боту)
     cur = DB.execute("SELECT user_id FROM users WHERE lower(username)=lower(?)", (username.lower(),))
     row = cur.fetchone()
     if not row:
@@ -664,7 +730,6 @@ async def activate_gift(m: Message):
         return
     target_id = int(row[0])
 
-    # Берём самую свежую подписку покупателя и переносим
     cur2 = DB.execute("""
         SELECT id, plan, created_at, expires_at FROM subscriptions
         WHERE user_id=? ORDER BY id DESC LIMIT 1
@@ -780,7 +845,6 @@ async def admin_bind_receive(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id, m.from_user.username):
         return
 
-    # 1) форвард из канала
     if m.forward_from_chat and m.forward_from_chat.type == ChatType.CHANNEL:
         chat = m.forward_from_chat
         channel_add(chat.id, chat.title)
@@ -788,7 +852,6 @@ async def admin_bind_receive(m: Message, state: FSMContext):
         await m.answer(f"Готово! Канал привязан: {chat.title or chat.id} (<code>{chat.id}</code>).")
         return
 
-    # 2) @username или -100id
     cid, uname = _parse_chat_ref(m.text or "")
     if uname:
         try:
@@ -905,7 +968,6 @@ async def admin_grant_plan(m: Message, state: FSMContext):
 
 @router.business_message(F.text | F.caption)
 async def business_handler(m: Message):
-    # доступ только для подписчиков
     if not (m.from_user and has_active_subscription(m.from_user.id)):
         try:
             await m.bot.send_message(
