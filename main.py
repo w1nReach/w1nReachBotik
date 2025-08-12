@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -153,9 +154,11 @@ HOWTO = (
 def kb_private(user_id: int | None = None, username: str | None = None) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Как подключить")],
-        [KeyboardButton(text="Создать кнопку")],
         [KeyboardButton(text="Планы и оплата")],
     ]
+    # «Создать кнопку» — только подписчики или админ
+    if user_id and (has_active_subscription(user_id) or is_admin(user_id, username)):
+        rows.insert(1, [KeyboardButton(text="Создать кнопку")])
     if user_id and is_admin(user_id, username):
         rows.append([KeyboardButton(text="Админ панель")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -171,7 +174,6 @@ def kb_admin() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🧩 Сделать кнопку (мастер)", callback_data="admin:makebtn")],
     ])
 
-# ====== НОВОЕ: инлайн-клавиатура планов (Купить/Подарить) ======
 def kb_plans_inline() -> InlineKeyboardMarkup:
     p = config.PRICES_STARS
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -205,7 +207,6 @@ class AdminGrant(StatesGroup):
     user = State()
     plan = State()
 
-# ====== НОВОЕ: состояние для подарка из инлайна ======
 class GiftBuy(StatesGroup):
     plan = State()
     target = State()
@@ -443,7 +444,8 @@ async def start_private(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
     await m.answer(
         "Привет! Я помогу подключить бота к Telegram Business.\n"
-        "Чтобы пользоваться в бизнес-чатах и каналах — нужна подписка.\n",
+        "Чтобы пользоваться в бизнес-чатах и каналах — нужна подписка.\n"
+        "Команды: /plans, /buy, /gift, /status, /howto, /admin\n",
         reply_markup=kb_private(m.from_user.id, m.from_user.username)
     )
 
@@ -556,8 +558,6 @@ async def gift_cmd(m: Message):
 
     await send_subscription_invoice(m, plan, gift_to_user_id=gift_to_user_id, gift_to_username=gift_to_username)
 
-# ====== НОВОЕ: кнопки Купить/Подарить (инлайн) ======
-
 @router.callback_query(F.data.startswith("buy:"))
 async def cb_buy(cq: CallbackQuery):
     if cq.message.chat.type != ChatType.PRIVATE:
@@ -620,6 +620,10 @@ async def gift_target_step(m: Message, state: FSMContext):
 
 @router.message((F.chat.type == ChatType.PRIVATE) & (F.text == "Создать кнопку"))
 async def create_btn_start(m: Message, state: FSMContext):
+    if not (has_active_subscription(m.from_user.id) or is_admin(m.from_user.id, m.from_user.username)):
+        await m.answer("Эта функция доступна по подписке. Оформи /plans и возвращайся 🙌",
+                       reply_markup=kb_private(m.from_user.id, m.from_user.username))
+        return
     await state.set_state(CreateBtn.text)
     await m.answer(
         "Ок! Отправь текст сообщения, который я опубликую с кнопкой.\n\n"
@@ -832,6 +836,9 @@ async def admin_callbacks(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer(f"Пользователей: {users}\nАктивных подписок: {active}")
         await cq.answer()
     elif action == "makebtn":
+        if not is_admin(cq.from_user.id, cq.from_user.username) and not has_active_subscription(cq.from_user.id):
+            await cq.answer("Эта функция по подписке. Оформи /plans.", show_alert=True)
+            return
         await state.set_state(CreateBtn.text)
         await cq.message.answer(
             "Ок! Отправь текст сообщения, который я опубликую с кнопкой.\n"
@@ -1004,6 +1011,34 @@ async def channel_handler(m: Message):
         return
     await edit_or_send_with_media(m, clean_text, buttons)
 
+# ======================== АВТО-ОБНОВЛЕНИЕ ИЗ GIT =========================
+
+def _git(cmd: list[str]) -> str:
+    out = subprocess.check_output(cmd, cwd=os.getcwd())
+    return out.decode("utf-8", "ignore").strip()
+
+def _has_git_repo() -> bool:
+    return os.path.isdir(os.path.join(os.getcwd(), ".git"))
+
+async def git_autoupdate_loop():
+    if not getattr(config, "AUTO_UPDATE_ENABLED", False):
+        return
+    interval = getattr(config, "AUTO_UPDATE_INTERVAL_MIN", 10)
+    remote = getattr(config, "GIT_REMOTE", "origin")
+    branch = getattr(config, "GIT_BRANCH", "main")
+    while True:
+        try:
+            if _has_git_repo():
+                _git(["git", "fetch", remote, branch])
+                local = _git(["git", "rev-parse", "HEAD"])
+                remote_head = _git(["git", "rev-parse", f"{remote}/{branch}"])
+                if local != remote_head:
+                    _git(["git", "pull", "--ff-only", remote, branch])
+                    os._exit(0)  # systemd перезапустит
+        except Exception:
+            pass
+        await asyncio.sleep(max(1, int(interval)) * 60)
+
 # ======================== ТОЧКА ВХОДА =========================
 
 async def main():
@@ -1024,6 +1059,9 @@ async def main():
         BotCommand(command="status", description="Статус подписки"),
         BotCommand(command="admin", description="Админ панель"),
     ])
+
+    # запускаем фоновый автоапдейтер
+    asyncio.create_task(git_autoupdate_loop())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
