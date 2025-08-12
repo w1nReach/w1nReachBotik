@@ -443,8 +443,7 @@ async def start_private(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
     await m.answer(
         "Привет! Я помогу подключить бота к Telegram Business.\n"
-        "Чтобы пользоваться в бизнес-чатах и каналах — нужна подписка.\n"
-        "Команды: /plans, /buy, /gift, /status, /howto, /admin\n",
+        "Чтобы пользоваться в бизнес-чатах и каналах — нужна подписка.\n",
         reply_markup=kb_private(m.from_user.id, m.from_user.username)
     )
 
